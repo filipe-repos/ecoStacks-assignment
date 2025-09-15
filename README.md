@@ -1,4 +1,4 @@
-# ecoSatcks-assignment
+# ecoStacks-assignment
 
 You need to have python and these libraries installed:\
 -pandas\
