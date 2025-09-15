@@ -3,11 +3,13 @@
 You need to have python and these libraries installed:
 -pandas
 -geopandas
--tifffile
--matplotlib
--shapely
 -rasterio
 -numpy
+-shapely
+
+optional:
+-tifffile
+-matplotlib
 -rasterstats
 
 after having installed python, add these libraries using the following command:
