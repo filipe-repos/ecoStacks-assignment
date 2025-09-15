@@ -7,11 +7,22 @@ from rasterio.mask import mask
 import numpy as np
 from shapely.geometry import mapping
 
+
+#indexes of bands for NDVI
+RED_BAND = 4 #Red
+NIR_BAND = 8 #InfraRed
+
 # -----------------
 # Load CSV points
 # -----------------
-df = pd.read_csv("point_locations.csv", names=["lon", "lat"], skiprows=1)
-gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs="EPSG:4326")
+# Load CSV normally (use headers X, Y)
+df = pd.read_csv("point_locations.csv")
+
+# Create GeoDataFrame with CRS = WGS84
+gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.X, df.Y), crs="EPSG:4326")
+
+print(gdf.head())
+print("Original CRS:", gdf.crs)
 
 # -----------------
 # Function to reproject a raster to UTM
@@ -41,71 +52,125 @@ def reproject_to_utm(src, utm_crs, out_path):
     return out_path
 
 # -----------------
-# Function to process a single TIFF
+# Create buffered union of points
 # -----------------
-def process_tiff(tiff_path, gdf, out_dir="ndvi_outputs"):
+def make_buffer_union(gdf, crs, buffer_radius=1000):
+    gdf_utm = gdf.to_crs(crs)
+    #gdf_utm["buffer"] = gdf_utm.geometry.buffer(buffer_radius)
+    buffers = gdf_utm.buffer(buffer_radius)
+    union = buffers.unary_union
+    return gdf_utm, [mapping(union)], buffers
+
+
+
+# -----------------
+# Compute NDVI array
+# -----------------
+def compute_ndvi(src, geom):
+    red_masked, out_transform = mask(src, geom, crop=True, filled=True, indexes=4, nodata=np.nan)
+    nir_masked, _ = mask(src, geom, crop=True, filled=True, indexes=8, nodata=np.nan)
+
+    if red_masked.size == 0 or nir_masked.size == 0:
+        return None, None
+
+    # Force shape (1, rows, cols)
+    if red_masked.ndim == 2: red_masked = red_masked[np.newaxis, :, :]
+    if nir_masked.ndim == 2: nir_masked = nir_masked[np.newaxis, :, :]
+
+    red = red_masked.astype("float32")[0]
+    nir = nir_masked.astype("float32")[0]
+
+    eps = 1e-10
+    ndvi = (nir - red) / (nir + red + eps)
+
+    # Back to shape (1, rows, cols) for rasterio
+    ndvi = np.expand_dims(ndvi, axis=0)
+
+    return ndvi, out_transform
+
+
+# -----------------
+# Save NDVI raster
+# -----------------
+def save_ndvi(ndvi, out_transform, src, out_path):
+    rows, cols = ndvi.shape[1], ndvi.shape[2]
+    profile = src.profile.copy()
+    profile.update(
+        count=1,
+        dtype="float32",
+        compress="lzw",
+        transform=out_transform,
+        height=rows,
+        width=cols,
+        nodata=np.nan,
+    )
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(ndvi)
+
+
+# -----------------
+# Compute per-buffer NDVI stats
+# -----------------
+def compute_stats(src, gdf_utm, buffers):
+    results = []
+    for idx, row in gdf_utm.iterrows():
+        geom = [mapping(buffers[idx])]
+        try:
+            red_masked, _ = mask(src, geom, crop=True, filled=True, indexes=4, nodata=np.nan)
+            nir_masked, _ = mask(src, geom, crop=True, filled=True, indexes=8, nodata=np.nan)
+        except ValueError:
+            continue
+
+        ndvi = (nir_masked.astype("float32") - red_masked.astype("float32")) / (
+            nir_masked.astype("float32") + red_masked.astype("float32") + 1e-10
+        )
+
+        vals = ndvi[np.isfinite(ndvi)]
+        if vals.size > 0:
+            results.append({
+                "point_id": idx,
+                "mean_ndvi": float(vals.mean()),
+                "min_ndvi": float(vals.min()),
+                "max_ndvi": float(vals.max()),
+                "std_ndvi": float(vals.std())
+            })
+    return results
+
+
+# -----------------
+# Main TIFF processor
+# -----------------
+def process_tiff(tiff_path, gdf, out_dir="ndvi_outputs", buffer_radius=1000):
     results = []
 
     with rasterio.open(tiff_path) as src:
-        # Skip single-band rasters (like NDVI results)
         if src.count < 8:
             print(f"Skipping {tiff_path} (only {src.count} band(s))")
             return pd.DataFrame()
 
-        # Determine UTM zone from points
+        # Reproject raster to match UTM CRS from points
         utm_crs = gdf.estimate_utm_crs()
-
-        # Reproject raster into UTM
-        utm_path = os.path.join(out_dir, "tmp_utm.tif")
         os.makedirs(out_dir, exist_ok=True)
+        utm_path = os.path.join(out_dir, "tmp_utm.tif")
         reproject_to_utm(src, utm_crs, utm_path)
 
-    # Open reprojected raster
     with rasterio.open(utm_path) as src:
-        # Reproject points to UTM
-        gdf_utm = gdf.to_crs(src.crs)
-
-        # Create 1 km buffer in meters
-        gdf_utm["buffer"] = gdf_utm.geometry.buffer(1000)
-
-        # Read red (B4) and nir (B8)
-        red = src.read(4).astype("float32")
-        nir = src.read(8).astype("float32")
-
-        # Compute NDVI
-        ndvi = (nir - red) / (nir + red + 1e-10)
+        # Reproject points to UTM and Buffer
+        gdf_utm, geom_union, buffers = make_buffer_union(gdf, src.crs, buffer_radius)
+        # Compute NDVI array
+        ndvi, out_transform = compute_ndvi(src, geom_union)
+        if ndvi is None:
+            return pd.DataFrame()
 
         # Save NDVI raster
-        profile = src.profile.copy()
-        profile.update(count=1, dtype="float32", compress="lzw")
         ndvi_path = os.path.join(out_dir, os.path.basename(tiff_path).replace(".tif", "_ndvi.tif"))
-        with rasterio.open(ndvi_path, "w", **profile) as dst:
-            dst.write(ndvi, 1)
+        save_ndvi(ndvi, out_transform, src, ndvi_path)
 
-        # Compute stats per buffer
-        for idx, row in gdf_utm.iterrows():
-            geom = [mapping(row["buffer"])]
-            try:
-                red_masked, _ = mask(src, geom, crop=True, filled=True, indexes=4)
-                nir_masked, _ = mask(src, geom, crop=True, filled=True, indexes=8)
-            except ValueError:
-                print(f" Skipping point {idx} — no overlap with {os.path.basename(tiff_path)}")
-                continue
-
-            ndvi_masked = (nir_masked.astype("float32") - red_masked.astype("float32")) / (
-                nir_masked.astype("float32") + red_masked.astype("float32") + 1e-10
-            )
-
-            vals = ndvi_masked[np.isfinite(ndvi_masked)]
-            if vals.size > 0:
-                results.append({
-                    "tiff_file": os.path.basename(tiff_path),
-                    "point_id": idx,
-                    "mean_ndvi": float(vals.mean()),
-                    "min_ndvi": float(vals.min()),
-                    "max_ndvi": float(vals.max()),
-                    "std_ndvi": float(vals.std())
-                })
+        # Compute per-buffer NDVI stats
+        stats = compute_stats(src, gdf_utm, buffers)
+        for s in stats:
+            s["tiff_file"] = os.path.basename(tiff_path)
+        results.extend(stats)
 
     return pd.DataFrame(results)
 
